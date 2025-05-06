@@ -1,5 +1,4 @@
-const bcrypt = require("bcrypt-nodejs");
-
+const bcrypt = require("bcrypt");
 /* The UserDAO must be constructed with a connected database object */
 function UserDAO(db) {
 
@@ -12,22 +11,19 @@ function UserDAO(db) {
         return new UserDAO(db);
     }
 
-    const usersCol = db.collection("users");
+    // Store the collection reference properly on 'this'
+    this.usersCol = db.collection("users");
 
     this.addUser = (userName, firstName, lastName, password, email, callback) => {
-
+        const hashedPassword = bcrypt.hashSync(password, 10);
+        
         // Create user document
         const user = {
             userName,
             firstName,
             lastName,
             benefitStartDate: this.getRandomFutureDate(),
-            password //received from request param
-            /*
-            // Fix for A2-1 - Broken Auth
-            // Stores password  in a safer way using one way encryption and salt hashing
-            password: bcrypt.hashSync(password, bcrypt.genSaltSync())
-            */
+            password: hashedPassword
         };
 
         // Add email if set
@@ -36,13 +32,13 @@ function UserDAO(db) {
         }
 
         this.getNextSequence("userId", (err, id) => {
-            if (err) {
-                return callback(err, null);
-            }
-            console.log(typeof(id));
-
+            if (err) return callback(err, null);
+            
             user._id = id;
-            usersCol.insert(user, (err, result) => !err ? callback(null, result.ops[0]) : callback(err, null));
+            this.usersCol.insertOne(user, (err, result) => {
+                if (err) return callback(err, null);
+                callback(null, result.ops[0]);
+            });
         });
     };
 
@@ -55,69 +51,48 @@ function UserDAO(db) {
     };
 
     this.validateLogin = (userName, password, callback) => {
-
-        // Helper function to compare passwords
-        const comparePassword = (fromDB, fromUser) => {
-            return fromDB === fromUser;
-            /*
-            // Fix for A2-Broken Auth
-            // compares decrypted password stored in this.addUser()
-            return bcrypt.compareSync(fromDB, fromUser);
-            */
-        };
-
         // Callback to pass to MongoDB that validates a user document
         const validateUserDoc = (err, user) => {
-
             if (err) return callback(err, null);
 
-            if (user) {
-                if (comparePassword(password, user.password)) {
-                    callback(null, user);
-                } else {
-                    const invalidPasswordError = new Error("Invalid password");
-                    // Set an extra field so we can distinguish this from a db error
-                    invalidPasswordError.invalidPassword = true;
-                    callback(invalidPasswordError, null);
-                }
-            } else {
-                const noSuchUserError = new Error("User: " + user + " does not exist");
-                // Set an extra field so we can distinguish this from a db error
+            if (!user) {
+                const noSuchUserError = new Error("User does not exist");
                 noSuchUserError.noSuchUser = true;
-                callback(noSuchUserError, null);
+                return callback(noSuchUserError, null);
             }
+
+            if (!bcrypt.compareSync(password, user.password)) {
+                const invalidPasswordError = new Error("Invalid password");
+                invalidPasswordError.invalidPassword = true;
+                return callback(invalidPasswordError, null);
+            }
+
+            callback(null, user);
         };
 
-        usersCol.findOne({
-            userName: userName
-        }, validateUserDoc);
+        this.usersCol.findOne({ userName: userName }, validateUserDoc);
     };
 
-    // This is the good one, see the next function
     this.getUserById = (userId, callback) => {
-        usersCol.findOne({
-            _id: parseInt(userId)
-        }, callback);
+        this.usersCol.findOne({ _id: parseInt(userId) }, callback);
     };
 
     this.getUserByUserName = (userName, callback) => {
-        usersCol.findOne({
-            userName: userName
-        }, callback);
+        this.usersCol.findOne({ userName: userName }, callback);
     };
 
     this.getNextSequence = (name, callback) => {
-        db.collection("counters").findAndModify({
-                _id: name
-            }, [], {
-                $inc: {
-                    seq: 1
-                }
-            }, {
-                new: true
-            },
-            (err, data) =>  err ? callback(err, null) : callback(null, data.value.seq));
+        db.collection("counters").findAndModify(
+            { _id: name },
+            [],
+            { $inc: { seq: 1 } },
+            { new: true },
+            (err, data) => {
+                if (err) return callback(err, null);
+                callback(null, data.value.seq);
+            }
+        );
     };
 }
 
-module.exports = { UserDAO };
+module.exports = { UserDAO };
