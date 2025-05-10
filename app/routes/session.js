@@ -1,10 +1,12 @@
-const validator = require('validator');
-const jwt = require('jsonwebtoken');
 const UserDAO = require("../data/user-dao").UserDAO;
 const AllocationsDAO = require("../data/allocations-dao").AllocationsDAO;
 const {
     environmentalScripts
 } = require("../../config/config");
+const validator = require('validator');
+const jwt = require('jsonwebtoken');
+const helmet = require('helmet');
+const ESAPI = require('node-esapi');
 
 /* The SessionHandler must be constructed with a connected db */
 function SessionHandler(db) {
@@ -12,6 +14,7 @@ function SessionHandler(db) {
 
     const userDAO = new UserDAO(db);
     const allocationsDAO = new AllocationsDAO(db);
+    const JWT_SECRET = process.env.JWT_SECRET || "your-secret-key-should-be-in-env-variables";
 
     const prepareUserData = (user, next) => {
         // Generate random allocations
@@ -24,28 +27,41 @@ function SessionHandler(db) {
         });
     };
 
-   // Middleware to check admin status
-   this.isAdminUserMiddleware = (req, res, next) => {
-    const token = req.cookies.token;
-    if (!token) return res.redirect("/login");
+    this.isAdminUserMiddleware = (req, res, next) => {
+        if (req.session.userId) {
+            return userDAO.getUserById(req.session.userId, (err, user) => {
+               return user && user.isAdmin ? next() : res.redirect("/login");
+            });
+        }
+        console.log("redirecting to login");
+        return res.redirect("/login");
+    };
 
-    jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
-        if (err || !decoded.isAdmin) return res.redirect("/login");
-        next();
-    });
-};
+    this.isLoggedInMiddleware = (req, res, next) => {
+        if (req.session.userId) {
+            return next();
+        }
+        console.log("redirecting to login");
+        return res.redirect("/login");
+    };
 
-// Middleware to check login status
-this.isLoggedInMiddleware = (req, res, next) => {
-    const token = req.cookies.token;
-    if (!token) return res.redirect("/login");
-
-    jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
-        if (err) return res.redirect("/login");
-        req.userId = decoded.id;
-        next();
-    });
-};
+    // Middleware to verify JWT token
+    this.verifyToken = (req, res, next) => {
+        const token = req.headers['x-access-token'] || req.headers['authorization'];
+        
+        if (!token) {
+            return res.status(403).send({ auth: false, message: 'No token provided.' });
+        }
+        
+        jwt.verify(token, JWT_SECRET, (err, decoded) => {
+            if (err) {
+                return res.status(500).send({ auth: false, message: 'Failed to authenticate token.' });
+            }
+            
+            req.userId = decoded.id;
+            next();
+        });
+    };
 
     this.displayLoginPage = (req, res, next) => {
         return res.render("login", {
@@ -55,58 +71,77 @@ this.isLoggedInMiddleware = (req, res, next) => {
             environmentalScripts
         });
     };
-    this.handleLoginRequest = (req, res, next) => {
-        const { userName, password } = req.body;
 
+    this.handleLoginRequest = (req, res, next) => {
+        let {
+            userName,
+            password
+        } = req.body;
+        
+        // Sanitize inputs
+        if (userName) {
+            userName = validator.escape(userName.trim());
+        }
+        
+        // Validate inputs
         if (!userName || !password) {
             return res.render("login", {
-                userName: "",
+                userName: userName || "",
                 password: "",
                 loginError: "Username and password are required",
                 environmentalScripts
             });
         }
 
-        if (!validator.isAlphanumeric(userName.replace(/\s/g, ''))) {
-            return res.render("login", {
-                userName,
-                password: "",
-                loginError: "Invalid username format",
-                environmentalScripts
-            });
-        }
-
         userDAO.validateLogin(userName, password, (err, user) => {
+            const errorMessage = "Invalid username and/or password";
+            
             if (err) {
-                const errorType = err.noSuchUser ? "Invalid username" : 
-                                err.invalidPassword ? "Invalid password" : 
-                                "Login error";
-                return res.render("login", {
-                    userName,
-                    password: "",
-                    loginError: errorType,
-                    environmentalScripts
-                });
+                if (err.noSuchUser || err.invalidPassword) {
+                    // Log sanitized username to prevent log injection
+                    console.log("Login error: %s", 
+                        ESAPI.encoder().encodeForHTML(userName).replace(/(\r\n|\r|\n)/g, '_'));
+
+                    return res.render("login", {
+                        userName: userName,
+                        password: "",
+                        // Use identical error message for both cases to prevent username enumeration
+                        loginError: errorMessage,
+                        environmentalScripts
+                    });
+                } else {
+                    return next(err);
+                }
             }
 
-            // JWT token generation
-            const token = jwt.sign(
-                { id: user._id, isAdmin: user.isAdmin },
-                process.env.JWT_SECRET,
-                { expiresIn: process.env.JWT_EXPIRES_IN || '1h' }
-            );
-
-            res.cookie('token', token, {
-                httpOnly: true,
-                secure: process.env.NODE_ENV === 'production'
+            // Regenerate session to prevent session fixation attacks
+            req.session.regenerate((err) => {
+                if (err) return next(err);
+                
+                req.session.userId = user._id;
+                
+                // Create JWT token for API authentication
+                const token = jwt.sign({ id: user._id }, JWT_SECRET, {
+                    expiresIn: 86400 // expires in 24 hours
+                });
+                
+                // Store token in a secure HTTP-only cookie
+                res.cookie('auth_token', token, { 
+                    httpOnly: true, 
+                    secure: process.env.NODE_ENV === 'production',
+                    sameSite: 'strict'
+                });
+                
+                return res.redirect(user.isAdmin ? "/benefits" : "/dashboard");
             });
-
-            res.redirect(user.isAdmin ? "/benefits" : "/dashboard");
         });
     };
+
     this.displayLogoutPage = (req, res) => {
-        res.clearCookie('token');
-        req.session.destroy(() => res.redirect("/"));
+        req.session.destroy(() => {
+            res.clearCookie('auth_token');
+            res.redirect("/");
+        });
     };
 
     this.displaySignupPage = (req, res) => {
@@ -122,95 +157,150 @@ this.isLoggedInMiddleware = (req, res, next) => {
         });
     };
 
-   
     const validateSignup = (userName, firstName, lastName, password, verify, email, errors) => {
+        const USER_RE = /^[a-zA-Z0-9_]{3,20}$/; // More restrictive username regex
+        const FNAME_RE = /^[a-zA-Z- ]{1,100}$/;
+        const LNAME_RE = /^[a-zA-Z- ]{1,100}$/;
+        const EMAIL_RE = /^[\S]+@[\S]+\.[\S]+$/;
+        // Fix for A2-2 - Broken Authentication - requires stronger password
+        // At least 8 characters with numbers and both lowercase and uppercase letters
+        const PASS_RE = /^(?=.*\d)(?=.*[a-z])(?=.*[A-Z]).{8,}$/;
+
         errors.userNameError = "";
+        errors.firstNameError = "";
+        errors.lastNameError = "";
         errors.passwordError = "";
         errors.verifyError = "";
         errors.emailError = "";
 
-        if (!/^[a-zA-Z0-9]+$/.test(userName)) {
-            errors.userNameError = "Username must be alphanumeric";
+        // Validate username
+        if (!USER_RE.test(userName)) {
+            errors.userNameError = "Invalid username. Use 3-20 alphanumeric characters or underscores.";
             return false;
         }
-
-        if (!/^[a-zA-Z ]+$/.test(firstName) || !/^[a-zA-Z ]+$/.test(lastName)) {
-            errors.firstNameError = "Names can only contain letters";
+        
+        // Validate first name
+        if (!FNAME_RE.test(firstName)) {
+            errors.firstNameError = "Invalid first name.";
             return false;
         }
-
-        const strongPasswordRegex = /^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&])[A-Za-z\d@$!%*?&]{8,20}$/;
-        if (!strongPasswordRegex.test(password)) {
-            errors.passwordError = "Password must be 8-20 chars with uppercase, lowercase, number & special char";
+        
+        // Validate last name
+        if (!LNAME_RE.test(lastName)) {
+            errors.lastNameError = "Invalid last name.";
             return false;
         }
-
+        
+        // Validate password strength
+        if (!PASS_RE.test(password)) {
+            errors.passwordError = "Password must be at least 8 characters" +
+                " including numbers, lowercase and uppercase letters.";
+            return false;
+        }
+        
+        // Verify passwords match
         if (password !== verify) {
             errors.verifyError = "Passwords must match";
             return false;
         }
-
-        if (email && !validator.isEmail(email)) {
-            errors.emailError = "Invalid email format";
-            return false;
+        
+        // Validate email if provided
+        if (email !== "") {
+            if (!EMAIL_RE.test(email)) {
+                errors.emailError = "Invalid email address";
+                return false;
+            }
         }
-
+        
         return true;
     };
 
-
     this.handleSignup = (req, res, next) => {
-        const { userName, firstName, lastName, password, verify, email } = req.body;
+        // Sanitize inputs
+        const userName = validator.escape(req.body.userName?.trim() || "");
+        const firstName = validator.escape(req.body.firstName?.trim() || "");
+        const lastName = validator.escape(req.body.lastName?.trim() || "");
+        const email = validator.normalizeEmail(req.body.email?.trim() || "");
+        const password = req.body.password || "";
+        const verify = req.body.verify || "";
+
+        // set these up in case we have an error case
         const errors = {
-            userName, firstName, lastName, email,
-            passwordError: "", verifyError: "",
-            userNameError: "", emailError: ""
+            "userName": userName,
+            "firstName": firstName,
+            "lastName": lastName,
+            "email": email
         };
 
-        if (!validateSignup(userName, firstName, lastName, password, verify, email, errors)) {
-            return res.render("signup", { ...errors, environmentalScripts });
-        }
-
-        userDAO.getUserByUserName(userName, (err, user) => {
-            if (err) return next(err);
-            if (user) {
-                errors.userNameError = "Username already exists";
-                return res.render("signup", { ...errors, environmentalScripts });
-            }
-
-            userDAO.addUser(userName, firstName, lastName, password, email, (err, user) => {
+        if (validateSignup(userName, firstName, lastName, password, verify, email, errors)) {
+            userDAO.getUserByUserName(userName, (err, user) => {
                 if (err) return next(err);
-                
-                prepareUserData(user, next);
-                
-                const token = jwt.sign(
-                    { id: user._id, isAdmin: user.isAdmin },
-                    process.env.JWT_SECRET,
-                    { expiresIn: process.env.JWT_EXPIRES_IN || '1h' }
-                );
 
-                res.cookie('token', token, {
-                    httpOnly: true,
-                    secure: process.env.NODE_ENV === 'production'
-                });
+                if (user) {
+                    errors.userNameError = "Username already in use. Please choose another";
+                    return res.render("signup", {
+                        ...errors,
+                        environmentalScripts
+                    });
+                }
 
-                res.render("dashboard", {
-                    ...user,
-                    userId: user._id,
-                    environmentalScripts
+                userDAO.addUser(userName, firstName, lastName, password, email, (err, user) => {
+                    if (err) return next(err);
+
+                    // Prepare data for the user
+                    prepareUserData(user, next);
+                    
+                    // Regenerate session to prevent session fixation attacks
+                    req.session.regenerate((err) => {
+                        if (err) return next(err);
+                        
+                        req.session.userId = user._id;
+                        // Set userId property. Required for left nav menu links
+                        user.userId = user._id;
+                        
+                        // Create JWT token for API authentication
+                        const token = jwt.sign({ id: user._id }, JWT_SECRET, {
+                            expiresIn: 86400 // expires in 24 hours
+                        });
+                        
+                        // Store token in a secure HTTP-only cookie
+                        res.cookie('auth_token', token, { 
+                            httpOnly: true, 
+                            secure: process.env.NODE_ENV === 'production',
+                            sameSite: 'strict'
+                        });
+
+                        return res.render("dashboard", {
+                            ...user,
+                            environmentalScripts
+                        });
+                    });
                 });
             });
-        });
+        } else {
+            console.log("User did not validate");
+            return res.render("signup", {
+                ...errors,
+                environmentalScripts
+            });
+        }
     };
 
     this.displayWelcomePage = (req, res, next) => {
-        if (!req.userId) return res.redirect("/login");
-        
-        userDAO.getUserById(req.userId, (err, user) => {
+        let userId;
+
+        if (!req.session.userId) {
+            console.log("welcome: Unable to identify user...redirecting to login");
+            return res.redirect("/login");
+        }
+
+        userId = req.session.userId;
+
+        userDAO.getUserById(userId, (err, doc) => {
             if (err) return next(err);
-            res.render("dashboard", {
-                ...user,
-                userId: user._id,
+            doc.userId = userId;
+            return res.render("dashboard", {
+                ...doc,
                 environmentalScripts
             });
         });
@@ -218,6 +308,3 @@ this.isLoggedInMiddleware = (req, res, next) => {
 }
 
 module.exports = SessionHandler;
-
-
-
